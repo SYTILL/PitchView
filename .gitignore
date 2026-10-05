@@ -1,0 +1,12 @@
+# build output (python build.py recreates these)
+build/
+dist/
+release/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# old design comparison screenshot
+design_candidates.png
