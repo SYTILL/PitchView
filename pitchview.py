@@ -109,6 +109,7 @@ THEMES = {
 
 # colour-map presets, dark (quiet) to light (loud); any of them can replace the theme's own
 GRADIENTS = {
+    "Glacier": ["#1b1f4b", "#3a5bd9", "#4fc3f7", "#b8f2e6", "#ffffff"],
     "Twilight": [(0, '#2a2350'), (0.3, '#6a48c8'), (0.55, '#4f9fec'), (0.8, '#b48cf0'), (1, '#f5efff')],
     "Aurora": [(0, '#123a4a'), (0.3, '#1fa6a0'), (0.6, '#8f7cf0'), (0.85, '#ff8fd0'), (1, '#fff0fa')],
     "Ember": [(0, '#3d1414'), (0.3, '#a3262a'), (0.6, '#f0652f'), (0.85, '#ffc061'), (1, '#fff6dc')],
@@ -119,7 +120,6 @@ GRADIENTS = {
     "Ocean": ["#141b4d", "#1f5f8b", "#16b3a6", "#9be7a8", "#f4fff2"],
     "Sunset": ["#2d1b4e", "#7b2d8e", "#e0457b", "#ffa45b", "#fff1c1"],
     "Forest": ["#10243a", "#1b6b4a", "#6cbf43", "#e6d94c", "#fff8d6"],
-    "Glacier": ["#1b1f4b", "#3a5bd9", "#4fc3f7", "#b8f2e6", "#ffffff"],
     "Fire": ["#1e0b2c", "#8b1e3f", "#e2501c", "#ffb02e", "#fff3b0"],
     "Neon": ["#1a0b3d", "#5b1fd6", "#00c2ff", "#39ffb0", "#f2ffde"],
     "Blossom": ["#2b1033", "#8e2c6f", "#e85d9a", "#ffb38a", "#fff2e6"],
@@ -184,7 +184,8 @@ def load_fonts():
         if name.lower().endswith((".otf", ".ttf")):
             loaded |= QtGui.QFontDatabase.addApplicationFont(os.path.join(FONT_DIR, name)) != -1
     if loaded:
-        font = QtGui.QFont(UI_FONT, 10)
+        font = QtGui.QFont(UI_FONT)
+        font.setPixelSize(13)  # pixels, not points: the same size on every display scale
         font.setHintingPreference(QtGui.QFont.PreferNoHinting)  # keeps the font's rounded shapes intact on Windows
         QtWidgets.QApplication.instance().setFont(font)
 
@@ -228,12 +229,15 @@ class AudioCapture:
         self.lock = threading.Lock()
         self.last_data = time.perf_counter()
         self.stream = None
+        self.heard = False
 
     def _callback(self, in_data, frame_count, time_info, status):
         x = np.frombuffer(in_data, dtype=np.float32)
         if self.channels > 1:
             x = x.reshape(-1, self.channels).mean(axis=1)
         self._push(x)
+        if not self.heard and np.any(x):
+            self.heard = True  # at least one non-zero sample arrived
         self.last_data = time.perf_counter()
         return None, pa.paContinue
 
@@ -427,8 +431,12 @@ class PianoRoll(QtWidgets.QWidget):
         for m, x0, _, b in self.keys:  # faint guide line on every C
             if m % 12 == 0:
                 base[min(int(round(x0)), w - 1)] = guide
-        self.keymap, self.base = keymap, base
+        # lanes are background: premultiplied with the window's background opacity
+        alpha = self.th.get("alpha", 1.0)
         self.base_rgb = np.stack([(base >> 16) & 255, (base >> 8) & 255, base & 255], 1).astype(np.float32)
+        pm = (self.base_rgb * alpha).astype(np.uint32)
+        base = (np.uint32(int(alpha * 255)) << 24) | (pm[:, 0] << 16) | (pm[:, 1] << 8) | pm[:, 2]
+        self.keymap, self.base = keymap, base.astype(np.uint32)
         self._geom_w = w
 
     def set_mode(self, mode):
@@ -436,10 +444,13 @@ class PianoRoll(QtWidgets.QWidget):
         self.update()
 
     def _colorize(self, lv):
-        """Freq-roll rows -> RGB, blended over the lanes by brightness: quiet = almost background."""
-        alpha = np.clip(lv * 1.4, 0, 1)[..., None]
+        """Freq-roll rows -> premultiplied RGBA over the (possibly see-through) lanes: quiet = almost background."""
+        a = np.clip(lv * 1.4, 0, 1)[..., None]
+        bg_a = self.th.get("alpha", 1.0)
         col = self.lut_rgb[(np.clip(lv, 0, 1) * 255).astype(np.int32)]
-        return (self.base_rgb + (col - self.base_rgb) * alpha).astype(np.uint8)
+        rgb = col * a + self.base_rgb * bg_a * (1 - a)
+        alpha = (a + bg_a * (1 - a)) * 255
+        return np.concatenate([rgb, alpha], axis=-1).astype(np.uint8)
 
     def _rgb_valid(self):
         return (self.hist_rgb is not None and self.hist_f is not None
@@ -525,7 +536,7 @@ class PianoRoll(QtWidgets.QWidget):
             if not self._rgb_valid():  # after a resize or theme change: colour the whole history once
                 self.hist_rgb = self._colorize(self.hist_f)
             img = np.ascontiguousarray(self.hist_rgb)
-            qp.drawImage(0, 0, QtGui.QImage(img.data, w, hh, w * 3, QtGui.QImage.Format_RGB888))
+            qp.drawImage(0, 0, QtGui.QImage(img.data, w, hh, w * 4, QtGui.QImage.Format_RGBA8888_Premultiplied))
             lv = None
             drawn = True
         elif self.hist is not None and self.hist.shape[0] == hh:
@@ -535,13 +546,14 @@ class PianoRoll(QtWidgets.QWidget):
         if lv is not None:
             img = np.where(lv >= 0, self.lut[(np.clip(lv, 0, 1) * 255).astype(np.int32)], self.base)
             img = np.ascontiguousarray(img, np.uint32)
-            qimg = QtGui.QImage(img.data, w, hh, w * 4, QtGui.QImage.Format_RGB32)
+            qimg = QtGui.QImage(img.data, w, hh, w * 4, QtGui.QImage.Format_ARGB32_Premultiplied)
             qp.drawImage(0, 0, qimg)
         elif not drawn:
-            qp.fillRect(0, 0, w, hh, QtGui.QColor(self.th["lane_w"]))
+            lane = QtGui.QColor(self.th["lane_w"])
+            lane.setAlphaF(self.th.get("alpha", 1.0))
+            qp.fillRect(0, 0, w, hh, lane)
 
         y0 = hh
-        qp.fillRect(QtCore.QRectF(0, y0, w, self.KB_H), QtGui.QColor(self.th["panel"]))  # shows in the gaps
         qp.setRenderHint(QtGui.QPainter.Antialiasing, True)
         font = qp.font()
         font.setPointSize(7)
@@ -743,10 +755,13 @@ class GlowSpectrum(QtWidgets.QWidget):
             # height above the bottom of each pixel row; 1px soft edge along the curve
             above = (h - 0.5 - np.arange(h, dtype=np.float32))[:, None]
             v *= np.clip(self.hcol[None, :] * h - above + 0.5, 0, 1)
-        # v is in 0..1, so this blend stays inside 0..255: no clip needed
-        rgb = v[:, :, None] * (self.lut_rgb[cidx] - self.bg_rgb)[None, :, :]
-        rgb += self.bg_rgb
-        return np.ascontiguousarray(rgb, np.uint8)  # packed RGB888
+        # premultiplied ARGB: colour v * lut with alpha v, so the card behind (opaque or see-through) shows
+        # wherever there is no glow; over an opaque card this looks exactly like blending with its colour
+        col = self.lut_rgb[cidx][None, :, :] * v[:, :, None]
+        a = (v * 255).astype(np.uint32)
+        c = col.astype(np.uint32)
+        img = (a << 24) | (c[..., 0] << 16) | (c[..., 1] << 8) | c[..., 2]
+        return np.ascontiguousarray(img, np.uint32)
 
     @staticmethod
     def _polyline(x0, ys):
@@ -778,7 +793,7 @@ class GlowSpectrum(QtWidgets.QWidget):
         """Everything outside the walls is dimmed and hatched: it is not analysed."""
         th = self.th
         shade = QtGui.QColor(th["panel"])
-        shade.setAlpha(225)
+        shade.setAlphaF(0.88 * th.get("alpha", 1.0))  # dims like the rest of the background
         hatch = QtGui.QColor(th["dim"])
         hatch.setAlpha(45)
         for i in (0, 1):
@@ -799,8 +814,7 @@ class GlowSpectrum(QtWidgets.QWidget):
         th = self.th
         path = QtGui.QPainterPath()
         path.addRoundedRect(QtCore.QRectF(0, 0, w, h), self.RADIUS, self.RADIUS)
-        qp.setClipPath(path)
-        qp.fillRect(0, 0, w, h, QtGui.QColor(th["panel"]))
+        qp.setClipPath(path)  # no fill of its own: the card behind is the background
 
         r = self._plot_rect()
         x0, pw, ih = r.left(), int(r.width()), int(r.height())
@@ -815,7 +829,7 @@ class GlowSpectrum(QtWidgets.QWidget):
             img = self._render(pw, rh)
             qp.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
             qp.drawImage(QtCore.QRectF(x0, 0, pw, ih),
-                         QtGui.QImage(img.data, pw, rh, pw * 3, QtGui.QImage.Format_RGB888))
+                         QtGui.QImage(img.data, pw, rh, pw * 4, QtGui.QImage.Format_ARGB32_Premultiplied))
         if self.hcol is not None and self.mode != "glow":
             ys = ih - self.hcol * ih
             ridge = QtGui.QColor(th["curve"])
@@ -974,8 +988,7 @@ class LevelMeter(QtWidgets.QWidget):
         th = self.th
         clip = QtGui.QPainterPath()
         clip.addRoundedRect(QtCore.QRectF(0, 0, w, h), self.RADIUS, self.RADIUS)
-        qp.setClipPath(clip)
-        qp.fillRect(0, 0, w, h, QtGui.QColor(th["panel"]))
+        qp.setClipPath(clip)  # no fill of its own: the card behind is the background
         r = self._rect()
 
         # bar: track, level fill (same colours as the spectrum), 10 dB marks, peak hold
@@ -1030,7 +1043,7 @@ class TiltGauge(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(100, 100)
+        self.setFixedSize(84, 84)
         self.setCursor(QtCore.Qt.SizeAllCursor)
         self.setToolTip("Spectrum tilt, in dB per octave around 1 kHz.\n"
                         "+ raises the lows and lowers the highs; – does the opposite.\n"
@@ -1131,6 +1144,130 @@ class TiltGauge(QtWidgets.QWidget):
         qp.end()
 
 
+class Bubble(QtWidgets.QLabel):
+    """A small pill-shaped label drawn over the window, placed exactly where it is told.
+
+    Used for the Decay value under the slider and for short notices at the bottom of the window;
+    unlike a tooltip it never moves itself, so it doesn't jump while it follows something.
+    """
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setObjectName("bubble")
+        self.setAlignment(QtCore.Qt.AlignCenter)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        self.hide()
+        self._timer = QtCore.QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.hide)
+
+    def show_at(self, text, center_x, top_y, hide_after_ms=0):
+        """Show `text` centred on center_x, top edge at top_y (both in parent coordinates)."""
+        self.setText(text)
+        self.adjustSize()
+        self.move(int(center_x - self.width() / 2), int(top_y))
+        self.show()
+        self.raise_()
+        if hide_after_ms:
+            self._timer.start(hide_after_ms)
+        else:
+            self._timer.stop()
+
+    def hide_later(self, ms):
+        self._timer.start(ms)
+
+
+class WindowFrame(QtWidgets.QWidget):
+    """Central widget of the frameless window: paints the (see-through) window background with rounded
+    corners and lets the outer margin resize the window like a normal frame."""
+
+    EDGE = 8  # px of margin that act as a resize border
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.color = QtGui.QColor("#1c1c1f")
+
+    def _edges(self, pos):
+        if self.window().isMaximized():
+            return QtCore.Qt.Edges()
+        e, r = QtCore.Qt.Edges(), self.rect()
+        if pos.x() <= self.EDGE:
+            e |= QtCore.Qt.LeftEdge
+        if pos.x() >= r.width() - self.EDGE:
+            e |= QtCore.Qt.RightEdge
+        if pos.y() <= self.EDGE:
+            e |= QtCore.Qt.TopEdge
+        if pos.y() >= r.height() - self.EDGE:
+            e |= QtCore.Qt.BottomEdge
+        return e
+
+    def mouseMoveEvent(self, ev):
+        e = self._edges(ev.pos())
+        shapes = {
+            int(QtCore.Qt.LeftEdge | QtCore.Qt.TopEdge): QtCore.Qt.SizeFDiagCursor,
+            int(QtCore.Qt.RightEdge | QtCore.Qt.BottomEdge): QtCore.Qt.SizeFDiagCursor,
+            int(QtCore.Qt.RightEdge | QtCore.Qt.TopEdge): QtCore.Qt.SizeBDiagCursor,
+            int(QtCore.Qt.LeftEdge | QtCore.Qt.BottomEdge): QtCore.Qt.SizeBDiagCursor,
+            int(QtCore.Qt.LeftEdge): QtCore.Qt.SizeHorCursor, int(QtCore.Qt.RightEdge): QtCore.Qt.SizeHorCursor,
+            int(QtCore.Qt.TopEdge): QtCore.Qt.SizeVerCursor, int(QtCore.Qt.BottomEdge): QtCore.Qt.SizeVerCursor,
+        }
+        if int(e) in shapes:
+            self.setCursor(shapes[int(e)])
+        else:
+            self.unsetCursor()
+
+    def mousePressEvent(self, ev):
+        e = self._edges(ev.pos())
+        if ev.button() == QtCore.Qt.LeftButton and int(e):
+            self.window().windowHandle().startSystemResize(e)
+
+    def paintEvent(self, ev):
+        qp = QtGui.QPainter(self)
+        qp.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        radius = 0 if self.window().isMaximized() else 14
+        qp.setPen(QtCore.Qt.NoPen)
+        qp.setBrush(self.color)
+        qp.drawRoundedRect(QtCore.QRectF(self.rect()), radius, radius)
+        qp.end()
+
+
+class TitleBar(QtWidgets.QWidget):
+    """Slim title bar for the frameless window: drag to move (with Windows snapping), double-click to
+    maximise, and minimise / maximise / close buttons."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(26)
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(6, 0, 0, 0)
+        lay.setSpacing(4)
+        self.label = QtWidgets.QLabel(f"PitchView {VERSION}")
+        self.label.setProperty("caption", True)
+        lay.addWidget(self.label)
+        lay.addStretch(1)
+        for name, text, slot in (("winMin", "–", lambda: self.window().showMinimized()),
+                                 ("winMax", "□", self._toggle_max),
+                                 ("winClose", "✕", lambda: self.window().close())):
+            b = QtWidgets.QToolButton()
+            b.setObjectName(name)
+            b.setText(text)
+            b.setFixedSize(30, 22)
+            b.clicked.connect(slot)
+            lay.addWidget(b)
+
+    def _toggle_max(self):
+        w = self.window()
+        w.showNormal() if w.isMaximized() else w.showMaximized()
+
+    def mousePressEvent(self, ev):
+        if ev.button() == QtCore.Qt.LeftButton:
+            self.window().windowHandle().startSystemMove()
+
+    def mouseDoubleClickEvent(self, ev):
+        self._toggle_max()
+
+
 class TitleMark(QtWidgets.QWidget):
     """'PITCHVIEW' wordmark filled with the theme's accent gradient."""
 
@@ -1163,7 +1300,7 @@ class TitleMark(QtWidgets.QWidget):
 TIPS = {
     "View": "How the spectrum is drawn.\n"
             "Prism – glow lines filling the spectrum's peaks\n"
-            "Beam – glow lines only (Chroma style)\n"
+            "Beam – glow lines only\n"
             "Line – plain lines; lightest to draw, and shows the threshold line",
     "Range": "Relative threshold: hide peaks more than this many dB below the loudest peak right now.\n"
              "The threshold on the level meter is a fixed line; Range follows the music instead.\n"
@@ -1190,8 +1327,11 @@ TIPS = {
     "Theme": "Dark or white window; the loudness colours are set by Gradient.",
     "Gradient": "Colours used for loudness (spectrum, meter, piano, note names).\n"
                 "↻ makes a new random one (and switches to Random).",
+    "Background": "How solid the window background is. Lower = see-through, so PitchView can sit over a video "
+                  "or another window; the spectrum, notes and keys stay fully visible.",
     "dB floor": "Bottom of the dB axis for the spectrum and the level meter (the top is always 0 dB).",
-    "Input": "Where the sound comes from.\n🔊 = whatever the PC is playing (loopback)\n🎤 = a microphone",
+    "Input": "Where the sound comes from.\n🔊 PC audio = whatever the PC is playing (speakers / headphones)\n"
+             "🎤 Mic = a microphone, e.g. to watch a real piano",
     "FFT size": "Length of the analysis window.\n"
                 "Bigger = finer resolution for low notes but slower response. 8192–16384 suits piano.",
     "A4 reference": "Tuning reference for note names.\n"
@@ -1202,7 +1342,7 @@ TIPS = {
 # spectrum view modes: (UI name, GlowSpectrum mode, tooltip)
 SPEC_MODES = [
     ("Prism", "both", "Glow lines filling the spectrum's peaks"),
-    ("Beam", "glow", "Glow lines only (Chroma style)"),
+    ("Beam", "glow", "Glow lines only"),
     ("Line", "curve", "Lines only · lightest"),
 ]
 
@@ -1210,8 +1350,11 @@ SPEC_MODES = [
 class MainWindow(QtWidgets.QMainWindow):
     MAX_LABELS = 12
     SPEC_GAP = 6  # px between the spectrum and the level meter
+    TITLE_MIN_W = 240  # px for the title column (wordmark + readout lines)
+    NOTE_BOX = 92      # px: the big note readout is a square this size
+    CTRL_H = 20        # px: height of every control in the header
     FRAME_MS = 16     # target frame time (~60 fps)
-    DEFAULTS_REV = 8  # latest one-time defaults update in _load_settings
+    DEFAULTS_REV = 12  # latest one-time defaults update in _load_settings
     ROLL_SHARPEN_RADIUS = 6  # px around each column searched for its peak's top in the freq roll
     ROLL_FLOOR = 0.18        # share of brightness kept away from peak tops (the faint continuous layer)
     ROLL_BASS_WIDTH = 8.0    # px (at half brightness) of freq-roll lines below C4: how wide C4-C5 notes look
@@ -1274,11 +1417,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- UI -----------------------------------------------------------------
     def _build_ui(self):
-        central = QtWidgets.QWidget()
+        # frameless and see-through: the window draws its own background, title bar and resize border
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.FramelessWindowHint)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+        central = self.frame = WindowFrame()
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
-        root.setContentsMargins(12, 12, 12, 12)
+        root.setContentsMargins(12, 4, 12, 12)
         root.setSpacing(12)
+        self.titlebar = TitleBar()
+        root.addWidget(self.titlebar)
+        root.setSpacing(6)
 
         def card(layout_cls=QtWidgets.QVBoxLayout, margins=10):
             f = QtWidgets.QFrame()
@@ -1288,29 +1437,33 @@ class MainWindow(QtWidgets.QMainWindow):
             return f, lay
 
         left = QtWidgets.QVBoxLayout()
-        left.setSpacing(12)
+        left.setSpacing(12)  # between the cards (the title bar sits 6 px above)
         root.addLayout(left, 1)
 
         # header card: wordmark + note readout + every everyday control + tilt gauge
-        head_card, head = card(QtWidgets.QHBoxLayout, 14)
+        head_card, head = card(QtWidgets.QHBoxLayout, 10)
+        head.setContentsMargins(12, 10, 12, 10)
         head.setSpacing(14)
         self.title = TitleMark()
         self.note_label = QtWidgets.QLabel("—")
-        self.note_label.setMinimumWidth(120)
-        self.note_label.setAlignment(QtCore.Qt.AlignCenter)  # the note sits centred in its fixed-width box
+        self.note_label.setAlignment(QtCore.Qt.AlignCenter)  # the note sits centred in its square box
         self.info_label = QtWidgets.QLabel("")
         self.chord_label = QtWidgets.QLabel("")
         for lab in (self.info_label, self.chord_label):
             # never ask the layout for more room: long text is cut to fit instead of widening the window
             lab.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
             lab.setMinimumWidth(0)
-        title_col = QtWidgets.QVBoxLayout()
+        title_box = QtWidgets.QWidget()
+        title_box.setMinimumWidth(self.TITLE_MIN_W)  # room for the whole "Hz · ¢ · dBFS" readout
+        title_col = QtWidgets.QVBoxLayout(title_box)
+        title_col.setContentsMargins(0, 0, 0, 0)
+        title_col.setSpacing(0)
         title_col.addWidget(self.title)
         title_col.addWidget(self.info_label)
         title_col.addWidget(self.chord_label)
         title_col.addStretch(1)
         head.addWidget(self.note_label)
-        head.addLayout(title_col, 1)
+        head.addWidget(title_box, 1)
 
         self.mode_combo = QtWidgets.QComboBox()
         for i, (name, _, tip) in enumerate(SPEC_MODES):
@@ -1323,7 +1476,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.npeaks_spin = QtWidgets.QSpinBox()
         self.npeaks_spin.setRange(1, self.MAX_LABELS)
         self.smooth_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.smooth_slider.setRange(0, 95)
+        self.smooth_slider.setRange(0, 100)  # position; the decay follows a curve, see _decay()
+        self.smooth_slider.sliderPressed.connect(self._show_decay_value)
+        self.smooth_slider.valueChanged.connect(self._show_decay_value)
+        self.smooth_slider.sliderReleased.connect(lambda: self.decay_bubble.hide_later(700))
+        self.opacity_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.opacity_slider.setRange(30, 100)  # % background opacity
+        self.opacity_slider.setPageStep(10)
+        self.opacity_slider.valueChanged.connect(self._apply_theme)
+        self.opacity_slider.sliderPressed.connect(self._show_opacity_value)
+        self.opacity_slider.valueChanged.connect(self._show_opacity_value)
+        self.opacity_slider.sliderReleased.connect(lambda: self.decay_bubble.hide_later(700))
         self.tune_spin = QtWidgets.QSpinBox()
         self.tune_spin.setRange(5, 50)
         self.tune_spin.setSuffix(" ¢")
@@ -1342,7 +1505,7 @@ class MainWindow(QtWidgets.QMainWindow):
             box = QtWidgets.QWidget()
             lay = QtWidgets.QVBoxLayout(box)
             lay.setContentsMargins(0, 0, 0, 0)
-            lay.setSpacing(3)
+            lay.setSpacing(4)  # caption -> control
             cap = QtWidgets.QLabel(caption)
             cap.setProperty("caption", True)
             lay.addWidget(cap)
@@ -1351,12 +1514,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         grid = QtWidgets.QGridLayout()
         grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(8)
+        grid.setVerticalSpacing(6)
         cells = [
             ("View", self.mode_combo), ("Range", stepper(self.rel_spin)),
-            ("Tuning tolerance", stepper(self.tune_spin)), ("Min note length", stepper(self.mindur_spin)),
-            ("Decay", self.smooth_slider), ("Harmonics", self.drop_harm), ("Display", self.pause_btn),
-            ("Settings", advanced_btn),
+            ("Min note length", stepper(self.mindur_spin)), ("Display", self.pause_btn),
+            ("Harmonics", self.drop_harm), ("Decay", self.smooth_slider),
+            ("Background", self.opacity_slider), ("Settings", advanced_btn),
         ]
         for i, (caption, widget) in enumerate(cells):
             grid.addWidget(cell(caption, widget), i // 4, i % 4)
@@ -1366,6 +1529,10 @@ class MainWindow(QtWidgets.QMainWindow):
             # number fields and dropdowns need room for the value plus their arrows
             widget.setMinimumWidth(86 if isinstance(widget, (QtWidgets.QAbstractSpinBox, QtWidgets.QComboBox)) else 70)
             widget.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        for _, widget in cells:
+            widget.setProperty("hdr", True)  # header controls share one height (stylesheet rule "hdr")
+        for widget in (self.smooth_slider, self.opacity_slider, self.drop_harm):  # no box of their own: centre them in the same row height
+            widget.setFixedHeight(self.CTRL_H)
         head.addLayout(grid, 2)
 
         self.tilt_gauge = TiltGauge()
@@ -1383,7 +1550,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.meter.thrMoved.connect(self._thr_moved)
         self.meter.topMoved.connect(self._top_moved)
         spec_lay.addWidget(self.meter)
-        left.addWidget(self.spec_card, 3)
+        # spectrum and piano share a splitter: drag the gap between them to trade height
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(12)
+        self.splitter.addWidget(self.spec_card)
+        left.addWidget(self.splitter, 1)
 
         self.roll_card, lay = card(QtWidgets.QHBoxLayout, 8)
         # same horizontal insets as the spectrum's plot area, so C1, C2, ... line up with the keys;
@@ -1423,7 +1595,9 @@ class MainWindow(QtWidgets.QMainWindow):
             side_lay.addSpacing(8)
         side_lay.addStretch(1)
         lay.addWidget(side)
-        left.addWidget(self.roll_card, 2)
+        self.splitter.addWidget(self.roll_card)
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 2)
 
         # detailed settings live in a separate dialog opened from "Advanced settings"
         self.settings_dlg = QtWidgets.QDialog(self)
@@ -1487,6 +1661,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.a4_spin.setSingleStep(0.5)
         self.a4_spin.setSuffix(" Hz")
         sform.addRow("A4 reference", stepper(self.a4_spin))
+        sform.addRow("Tuning tolerance", stepper(self.tune_spin))
 
         reset_btn = QtWidgets.QPushButton("Reset all settings")
         reset_btn.clicked.connect(self._reset_settings)
@@ -1497,10 +1672,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         for combo in self.findChildren(QtWidgets.QComboBox):
             self._polish_combo(combo)
+        self._show_idle()
+        self.decay_bubble = Bubble(self)
+        self.toast = Bubble(self)
         self._apply_tips()
         self._load_settings()
         self.roll.speed = self.roll_speed.value()
         self._roll_mode_changed(self.roll_mode_btn.isChecked())
+        self._restore_split()
 
         for w in (self.a4_spin, self.floor_spin):
             sig = w.currentIndexChanged if isinstance(w, QtWidgets.QComboBox) else w.valueChanged
@@ -1514,11 +1693,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- settings -----------------------------------------------------------
     SETTINGS = [  # (attr, key, default)
-        ("theme_combo", "theme", 0), ("mode_combo", "view_mode", 2),
+        ("theme_combo", "theme", 0), ("mode_combo", "view_mode", 0),
         ("fft_combo", "fft", 2),
         ("rel_spin", "rel", 18.0),
-        ("npeaks_spin", "npeaks", 6), ("roll_mode_btn", "roll_freq", False), ("roll_speed", "roll_speed", 1.0), ("mindur_spin", "mindur", 0), ("tune_spin", "tune", 30), ("smooth_slider", "smooth", 60), ("drop_harm", "harm", True),
-        ("a4_spin", "a4", 440.0), ("grad_combo", "gradient", GRADIENT_CHOICES.index("Aurora")), ("floor_spin", "floor", -90),
+        ("npeaks_spin", "npeaks", 6), ("roll_mode_btn", "roll_freq", False), ("roll_speed", "roll_speed", 1.0), ("mindur_spin", "mindur", 0), ("tune_spin", "tune", 30), ("smooth_slider", "smooth", 75), ("drop_harm", "harm", True),
+        ("a4_spin", "a4", 440.0), ("grad_combo", "gradient", GRADIENT_CHOICES.index("Glacier")), ("floor_spin", "floor", -90), ("opacity_slider", "opacity", 100),
     ]
 
     def _load_settings(self):
@@ -1559,6 +1738,24 @@ class MainWindow(QtWidgets.QMainWindow):
         if s.value("defaults_rev", 0, type=int) < 8:
             s.setValue("gradient", GRADIENT_CHOICES.index("Aurora"))
             s.setValue("defaults_rev", 8)
+        if s.value("defaults_rev", 0, type=int) < 9:
+            # Decay slider became curved: move it to the position that gives the same decay as before
+            if s.contains("smooth"):
+                old = min(s.value("smooth", 60, type=int), 95) / 100.0
+                pos = 1.0 - (1.0 - min(old / self.DECAY_MAX, 1.0)) ** (1 / self.DECAY_CURVE)
+                s.setValue("smooth", int(round(pos * 100)))
+            s.setValue("defaults_rev", 9)
+        if s.value("defaults_rev", 0, type=int) < 10:
+            s.setValue("smooth", 65)
+            s.setValue("gradient", GRADIENT_CHOICES.index("Glacier"))  # Glacier also moved to the top of the list
+            s.setValue("defaults_rev", 10)
+        if s.value("defaults_rev", 0, type=int) < 11:
+            s.setValue("smooth", 75)
+            s.setValue("defaults_rev", 11)
+        if s.value("defaults_rev", 0, type=int) < 12:
+            s.setValue("tilt", 0.0)
+            s.setValue("view_mode", 0)  # Prism
+            s.setValue("defaults_rev", 12)
         if not s.contains("view_mode") and s.contains("spec_mode"):
             # old 4-mode list: Prism+glow, peaks only (removed), glow, curve
             s.setValue("view_mode", {0: 0, 1: 0, 2: 1, 3: 2}.get(s.value("spec_mode", 0, type=int), 0))
@@ -1568,7 +1765,7 @@ class MainWindow(QtWidgets.QMainWindow):
         hi = float(np.clip(s.value("fmax", hi0, type=float), lo * MIN_RATIO, self.view_hi))
         self.walls_hz = [lo, hi]
         self.thr_db = float(np.clip(s.value("thr", -60.0, type=float), -150, -6))
-        self.tilt_db = float(np.clip(s.value("tilt", 1.5, type=float), -TiltGauge.RANGE, TiltGauge.RANGE))
+        self.tilt_db = float(np.clip(s.value("tilt", 0.0, type=float), -TiltGauge.RANGE, TiltGauge.RANGE))
         self.top_db = float(np.clip(s.value("top", -10.0, type=float), self.thr_db + LevelMeter.MIN_SPAN, 0.0))
         self.tilt_gauge.set_value(self.tilt_db, emit=False)
         for attr, key, default in self.SETTINGS:
@@ -1598,16 +1795,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_settings()  # widgets fire their change signals, so most views follow on their own
         self.roll.speed = self.roll_speed.value()
         self._roll_mode_changed(self.roll_mode_btn.isChecked())
+        self._restore_split()
         self._apply_theme()
         self._apply_mode()
         self._update_axes()
-        self.statusBar().showMessage("All settings reset to defaults.")
+        self._notify("All settings reset to defaults")
 
     def _save_settings(self):
         s = self.settings
         s.setValue("fmin", self.walls_hz[0])
         s.setValue("fmax", self.walls_hz[1])
         s.setValue("thr", self.thr_db)
+        s.setValue("split", self.splitter.saveState())
         s.setValue("input_name", self.dev_combo.currentText())
         s.setValue("tilt", self.tilt_db)
         s.setValue("top", self.top_db)
@@ -1636,7 +1835,11 @@ class MainWindow(QtWidgets.QMainWindow):
             th[key] = readable(self.lut_q[int(t * 255)], dark).name()
         c = QtGui.QColor(th["curve"])
         th["ghost"] = (c.red(), c.green(), c.blue(), 55)
+        th["alpha"] = self.opacity_slider.value() / 100.0  # background opacity; content stays solid
         self.th = th
+        self._idle_pix = None  # the idle glyph follows the gradient: redraw it
+        if getattr(self, "_idle", False):
+            self._show_idle()
 
         app = QtWidgets.QApplication.instance()
         pal = QtGui.QPalette()
@@ -1655,9 +1858,22 @@ class MainWindow(QtWidgets.QMainWindow):
             btn.setIconSize(QtCore.QSize(14, 14))
         chevron = self._chevron_icon(th["dim"])
         chevron_up = self._chevron_icon(th["dim"], up=True)
+        a = th["alpha"]
+
+        def see_through(key):
+            q = QtGui.QColor(th[key])
+            return f"rgba({q.red()}, {q.green()}, {q.blue()}, {a:.3f})"
+
+        self.frame.color = QtGui.QColor(th["bg"])
+        self.frame.color.setAlphaF(a)
+        self.frame.update()
         self.setStyleSheet(f"""
-            QMainWindow, QStatusBar {{ background: {th['bg']}; color: {th['dim']}; }}
-            QFrame#card {{ background: {th['panel']}; border-radius: 16px; }}
+            QMainWindow {{ background: transparent; color: {th['dim']}; }}
+            QFrame#card {{ background: {see_through('panel')}; border-radius: 16px; }}
+            QToolButton#winMin, QToolButton#winMax, QToolButton#winClose {{
+                background: transparent; color: {th['dim']}; border: none; border-radius: 6px; font-size: 13px; }}
+            QToolButton#winMin:hover, QToolButton#winMax:hover {{ background: {th['button']}; color: {th['fg']}; }}
+            QToolButton#winClose:hover {{ background: #e5484d; color: #ffffff; }}
             QDialog#settingsDialog {{ background: {th['panel']}; }}
             QAbstractSpinBox {{ padding-right: 20px; }}
             QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {{
@@ -1673,19 +1889,31 @@ class MainWindow(QtWidgets.QMainWindow):
                                         min-height: 24px; max-height: 24px; }}
             QAbstractSpinBox#compact::up-button {{ width: 14px; margin: 2px 3px 0 0; }}
             QAbstractSpinBox#compact::down-button {{ width: 14px; margin: 0 3px 2px 0; }}
+            QComboBox[hdr="true"], QAbstractSpinBox[hdr="true"], QPushButton[hdr="true"] {{
+                padding-top: 0; padding-bottom: 0; min-height: {self.CTRL_H}px; max-height: {self.CTRL_H}px;
+                border-radius: {self.CTRL_H // 2}px; font-size: 11px; }}
+            QAbstractSpinBox[hdr="true"]::up-button {{ width: 14px; margin: 1px 4px 0 0; }}
+            QAbstractSpinBox[hdr="true"]::down-button {{ width: 14px; margin: 0 4px 1px 0; }}
+            QAbstractSpinBox[hdr="true"]::up-arrow, QAbstractSpinBox[hdr="true"]::down-arrow {{ width: 7px; height: 7px; }}
+            QComboBox[hdr="true"]::down-arrow {{ width: 8px; height: 8px; }}
+            QCheckBox[hdr="true"] {{ font-size: 11px; }}
+            QSplitter::handle {{ background: transparent; }}
+            QSplitter::handle:hover {{ background: {th['guide']}; border-radius: 3px; margin: 4px 40%; }}
             QPushButton#roundIcon {{ min-width: 30px; max-width: 30px; min-height: 30px; max-height: 30px;
                                      padding: 0; border-radius: 15px; }}
             QPushButton#pill {{ border-radius: 11px; min-height: 22px; max-height: 22px; padding: 0 8px;
                                 font-size: 11px; }}
             QWidget#cardbody, QScrollArea, QScrollArea > QWidget > QWidget {{ background: {th['panel']}; }}
             QLabel {{ background: transparent; }}
+            QLabel#bubble {{ background: {th['button']}; color: {th['fg']}; border: 1px solid {th['guide']};
+                             border-radius: 9px; padding: 2px 9px; font-size: 11px; }}
             QLabel[section='true'] {{ color: {th['accent']}; font-weight: 700; letter-spacing: 1px;
                                       padding-top: 10px; }}
             QLabel[hint='true'] {{ color: {th['dim']}; }}
             QLabel[caption='true'] {{ color: {th['dim']}; font-size: 11px; }}
             QComboBox, QAbstractSpinBox, QPushButton {{
                 background: {th['button']}; color: {th['fg']}; border: none;
-                border-radius: 12px; padding: 4px 12px; min-height: 18px; }}
+                border-radius: 12px; padding: 2px 12px; min-height: 18px; font-size: 13px; }}
             QComboBox {{ combobox-popup: 0; }}  /* list opens below the box instead of over it */
             QComboBox::drop-down {{ border: none; width: 26px; }}
             QComboBox::down-arrow {{ image: url({chevron}); width: 10px; height: 10px; }}
@@ -1777,27 +2005,46 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._apply_theme()
 
+    def _restore_split(self):
+        state = self.settings.value("split")
+        if state is None or not self.splitter.restoreState(state):
+            self.splitter.setSizes([600, 400])  # default 3 : 2
+
+    def _check_mic(self, cap):
+        """A microphone that delivers only exact zeros is muted, disconnected or blocked by Windows."""
+        if cap is self.capture and not cap.heard:
+            self._notify("No sound from this microphone – check it's connected and not muted "
+                         "(Windows Settings → Sound / Privacy → Microphone)", 9000)
+
     def _rescan_devices(self):
         self._populate_devices(rescan=True)
         if self.capture:
-            self.statusBar().showMessage(f"Rescanned: {self.dev_combo.count()} inputs found · "
-                                         f"listening to {self.dev_combo.currentText()}", 6000)
+            self._notify(f"Rescanned: {self.dev_combo.count()} inputs found · listening to "
+                         f"{self.dev_combo.currentText()}")
 
     def _apply_mode(self, *_):
         self.glow.set_mode(SPEC_MODES[self.mode_combo.currentIndex()][1])
 
     def _note_style(self, color):
         c = color.name() if color is not None else self.th["dim"]
-        self.note_label.setStyleSheet(f"font-size: 64px; font-weight: 300; color: {c};")
+        self.note_label.setStyleSheet(f"font-size: {getattr(self, 'note_px', 48)}px; font-weight: 300; color: {c};")
         self._fix_header_sizes()
 
     def _fix_header_sizes(self):
         """Fixed sizes for the readouts, so changing notes never nudge the header layout."""
         if getattr(self, "_header_fixed", False):
             return
-        self.note_label.ensurePolished()
-        fm = self.note_label.fontMetrics()
-        self.note_label.setFixedWidth(max(fm.horizontalAdvance(t) for t in ("C#8", "G#8", "A#0", "—")) + 8)
+        self._header_fixed = True
+        side = self.NOTE_BOX
+        self.note_label.setFixedSize(side, side)  # square: as tall as the header's content
+        self.note_px = 60
+        while self.note_px > 20:
+            f = QtGui.QFont(self.note_label.font())
+            f.setPixelSize(self.note_px)
+            if max(QtGui.QFontMetrics(f).horizontalAdvance(t) for t in ("C#8", "G#8", "A#0")) <= side - 6:
+                break
+            self.note_px -= 2
+        self._note_style(None)
         for lab in (self.info_label, self.chord_label):
             lab.ensurePolished()
             lab.setFixedHeight(lab.fontMetrics().height() + 4)
@@ -1832,7 +2079,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for d in self.p.get_loopback_device_info_generator():
             if d["index"] == default_lb:
                 sel = self.dev_combo.count()
-            self.dev_combo.addItem("🔊 " + d["name"].replace(" [Loopback]", ""), d["index"])
+            self.dev_combo.addItem("🔊 PC audio · " + d["name"].replace(" [Loopback]", ""), d["index"])
         try:
             wasapi = self.p.get_host_api_info_by_type(pa.paWASAPI)["index"]
         except Exception:
@@ -1840,7 +2087,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for i in range(self.p.get_device_count()):
             d = self.p.get_device_info_by_index(i)
             if d["maxInputChannels"] > 0 and not d.get("isLoopbackDevice") and d["hostApi"] == wasapi:
-                self.dev_combo.addItem("🎤 " + d["name"], d["index"])
+                self.dev_combo.addItem("🎤 Mic · " + d["name"], d["index"])
         if keep:
             i = self.dev_combo.findText(keep)
             if i >= 0:
@@ -1862,9 +2109,10 @@ class MainWindow(QtWidgets.QMainWindow):
             cap = AudioCapture(self.p, dev)
             cap.start()
             self.capture = cap
-            self.statusBar().showMessage(f"{dev['name']}  ·  {cap.rate} Hz  ·  {cap.channels}ch")
+            if not dev.get("isLoopbackDevice"):
+                QtCore.QTimer.singleShot(3000, lambda c=cap: self._check_mic(c))
         except Exception as e:
-            self.statusBar().showMessage(f"Couldn't open device: {e}")
+            self._notify(f"Couldn't open device: {e}", 8000)
 
     # ---- walls --------------------------------------------------------------
     def _xnorm(self, f):
@@ -1988,6 +2236,86 @@ class MainWindow(QtWidgets.QMainWindow):
             row = blend * bass + (1 - blend) * row
         return row
 
+    DECAY_CURVE = 2.5   # >1 gives the slow end (decay 0.8-1) about half of the slider's travel
+    DECAY_MAX = 0.98
+
+    def _decay(self):
+        """Slider position (0..100) -> per-frame decay factor; the slow end gets most of the travel."""
+        pos = self.smooth_slider.value() / 100.0
+        return self.DECAY_MAX * (1.0 - (1.0 - pos) ** self.DECAY_CURVE)  # reaches DECAY_MAX exactly at 100
+
+    def _show_decay_value(self, *_):
+        """While the Decay slider is dragged or scrolled, show its position (0.00-1.00) under the handle."""
+        sl = self.smooth_slider
+        self._slider_bubble(sl, f"{sl.value() / sl.maximum():.2f}")
+
+    def _show_opacity_value(self, *_):
+        self._slider_bubble(self.opacity_slider, f"{self.opacity_slider.value()}%")
+
+    def _slider_bubble(self, sl, text):
+        """Value bubble right under a slider's handle while it is dragged or scrolled."""
+        if not (sl.isSliderDown() or sl.underMouse()):
+            return
+        opt = QtWidgets.QStyleOptionSlider()
+        sl.initStyleOption(opt)
+        handle = sl.style().subControlRect(QtWidgets.QStyle.CC_Slider, opt, QtWidgets.QStyle.SC_SliderHandle, sl)
+        pt = sl.mapTo(self, QtCore.QPoint(handle.center().x(), sl.height() + 2))
+        self.decay_bubble.show_at(text, pt.x(), pt.y(), hide_after_ms=0 if sl.isSliderDown() else 900)
+
+    IDLE_ICON = 68  # px: icon glyph shown in the note box while nothing is sounding
+
+    def _show_idle(self):
+        """Nothing sounding: show the app's glyph (peak line + dot) in the note box, in the gradient's colours."""
+        self._idle = True
+        if not hasattr(self, "th"):  # before the first theme: _apply_theme draws it
+            return
+        if getattr(self, "_idle_pix", None) is None:
+            self._idle_pix = self._glyph_pixmap(self.IDLE_ICON)
+        self.note_label.setPixmap(self._idle_pix)
+
+    def _glyph_pixmap(self, side):
+        """The icon's line-and-dot glyph drawn live, so it follows the chosen gradient and theme."""
+        dpr = self.devicePixelRatioF()
+        pix = QtGui.QPixmap(int(side * dpr), int(side * dpr))
+        pix.setDevicePixelRatio(dpr)
+        pix.fill(QtCore.Qt.transparent)
+        # geometry of the 1024-unit icon artwork: curve from x 0.16 to 0.84, baseline at y 0.70
+        lw, dot_r = 0.045, 0.0332
+        extent = 0.68 + lw                       # widest part: the line incl. its round ends
+        scale = side / extent
+        top = 0.28 - 3.6 * dot_r                 # top of the dot
+        bottom = 0.70 + lw / 2
+        ox = (side - 0.68 * scale) / 2 - 0.16 * scale
+        oy = (side - (bottom - top) * scale) / 2 - top * scale
+
+        def pt(x, y):
+            return QtCore.QPointF(ox + x * scale, oy + y * scale)
+
+        xs = np.linspace(0.16, 0.84, 160)
+        hs = 0.08 * np.exp(-((xs - 0.34) / 0.05) ** 2) + 0.42 * np.exp(-((xs - 0.56) / 0.045) ** 2)
+        path = QtGui.QPainterPath(pt(xs[0], 0.70 - hs[0]))
+        for x, h in zip(xs[1:], hs[1:]):
+            path.lineTo(pt(x, 0.70 - h))
+        dark = QtGui.QColor(self.th["bg"]).lightnessF() < 0.5
+        g = QtGui.QLinearGradient(pt(0.16, 0), pt(0.84, 0))
+        for pos, t in ((0.0, 0.40), (0.5, 0.70), (1.0, 0.95)):
+            g.setColorAt(pos, readable(self.lut_q[int(t * 255)], dark))
+        qp = QtGui.QPainter(pix)
+        qp.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        qp.setPen(QtGui.QPen(QtGui.QBrush(g), lw * scale, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
+        qp.drawPath(path)
+        peak = int(np.argmax(hs))
+        qp.setPen(QtCore.Qt.NoPen)
+        qp.setBrush(QtGui.QColor(self.th["fg"]))
+        qp.drawEllipse(pt(xs[peak], 0.70 - hs[peak] - 2.6 * dot_r), dot_r * scale, dot_r * scale)
+        qp.end()
+        return pix
+
+    def _notify(self, text, ms=4000):
+        """Short notice at the bottom centre of the window (replaces the old status bar)."""
+        c = self.centralWidget()
+        self.toast.show_at(text, c.width() / 2, c.height() - 44, hide_after_ms=ms)
+
     def _tilt_changed(self, v):
         self.tilt_db = v
 
@@ -2029,7 +2357,7 @@ class MainWindow(QtWidgets.QMainWindow):
         an = self.analyzer
         an.set_size(self.fft_combo.currentData(), cap.rate)
         x = cap.latest(an.n)
-        db = an.spectrum(x, self.smooth_slider.value() / 100.0)
+        db = an.spectrum(x, self._decay())
         if self.tilt_db:
             # tilt the whole spectrum so what is drawn is also what is detected
             db = db + self._tilt_curve()
@@ -2053,6 +2381,7 @@ class MainWindow(QtWidgets.QMainWindow):
             cents = (pm - round(pm)) * 100
             self.last_note, self.last_note_time = midi_name(pm), now
             self.note_label.setText(self.last_note)
+            self._idle = False
             self._note_style(self._ink(lv_peaks[0]))
             real_db = pd + self.tilt_db * np.log2(pf / 1000.0)  # readout without the tilt
             self.info_label.setText(f"{pf:.1f} Hz   {cents:+.0f}¢   {real_db:.1f} dBFS")
@@ -2062,7 +2391,7 @@ class MainWindow(QtWidgets.QMainWindow):
         elif self.last_note and now - self.last_note_time < 0.4:
             self._note_style(None)
         else:
-            self.note_label.setText("—")
+            self._show_idle()
             self._note_style(None)
             self.info_label.setText("")
             self.chord_label.setText("")
@@ -2159,7 +2488,7 @@ class MainWindow(QtWidgets.QMainWindow):
             with open(self._src, encoding="utf-8") as fh:
                 compile(fh.read(), self._src, "exec")
         except SyntaxError as e:
-            self.statusBar().showMessage(f"Not restarted: syntax error on line {e.lineno}: {e.msg}")
+            self._notify(f"Not restarted: syntax error on line {e.lineno}: {e.msg}", 10000)
             return
         except OSError:
             return
