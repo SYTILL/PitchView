@@ -1599,6 +1599,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.splitter.setStretchFactor(0, 3)
         self.splitter.setStretchFactor(1, 2)
 
+        # expand buttons at the top-left of each plot: one view takes the whole area, press again to restore
+        self.solo = None
+        self.expand_btns = {}
+        for key, card_w, tip in (("spec", self.spec_card, "Spectrum only"), ("roll", self.roll_card, "Piano only")):
+            b = QtWidgets.QToolButton(card_w)
+            b.setObjectName("expand")
+            b.setToolTip(tip)
+            b.setCursor(QtCore.Qt.PointingHandCursor)
+            b.setFixedSize(18, 18)
+            b.move(8, 8)  # top-left corner of each card (same gap from the top and the left edge)
+            b.clicked.connect(lambda _=False, k=key: self._toggle_solo(k))
+            b.raise_()
+            self.expand_btns[key] = b
+
         # detailed settings live in a separate dialog opened from "Advanced settings"
         self.settings_dlg = QtWidgets.QDialog(self)
         self.settings_dlg.setObjectName("settingsDialog")
@@ -1852,6 +1866,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pal.setColor(QtGui.QPalette.Highlight, QtGui.QColor(th["accent"]))
         pal.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor(th["bg"]))
         app.setPalette(pal)
+        self._update_expand_icons()
         refresh_icon = QtGui.QIcon(self._refresh_icon(th["fg"]))
         for btn in (self.refresh_btn, self.reroll_btn):
             btn.setIcon(refresh_icon)
@@ -1899,6 +1914,8 @@ class MainWindow(QtWidgets.QMainWindow):
             QCheckBox[hdr="true"] {{ font-size: 11px; }}
             QSplitter::handle {{ background: transparent; }}
             QSplitter::handle:hover {{ background: {th['guide']}; border-radius: 3px; margin: 4px 40%; }}
+            QToolButton#expand {{ background: transparent; border: none; border-radius: 6px; }}
+            QToolButton#expand:hover {{ background: {th['button']}; }}
             QPushButton#roundIcon {{ min-width: 30px; max-width: 30px; min-height: 30px; max-height: 30px;
                                      padding: 0; border-radius: 15px; }}
             QPushButton#pill {{ border-radius: 11px; min-height: 22px; max-height: 22px; padding: 0 8px;
@@ -1946,6 +1963,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
         for w in (self.roll, self.glow, self.meter, self.title, self.tilt_gauge):
             w.set_theme(th, self.lut, self.lut_q, self.lut_rgb)
+
+    @staticmethod
+    def _expand_icon(color, collapse=False):
+        """Two diagonal arrows: pointing out (expand) or in (collapse back)."""
+        name = f"pitchview_{'collapse' if collapse else 'expand'}_{color.lstrip('#')}.svg"
+        path = os.path.join(tempfile.gettempdir(), name)
+        if not os.path.exists(path):
+            if collapse:  # arrow heads at the inner ends
+                d = "M2 14 L6.5 9.5 M3.5 9.5 L6.5 9.5 L6.5 12.5 M14 2 L9.5 6.5 M9.5 3.5 L9.5 6.5 L12.5 6.5"
+            else:         # arrow heads at the outer corners
+                d = "M9.5 6.5 L14 2 M10.5 2 L14 2 L14 5.5 M6.5 9.5 L2 14 M2 10.5 L2 14 L5.5 14"
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(f'<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">'
+                         f'<path d="{d}" fill="none" stroke="{color}" stroke-width="1.6" '
+                         f'stroke-linecap="round" stroke-linejoin="round"/></svg>')
+        return path
 
     @staticmethod
     def _refresh_icon(color):
@@ -2015,6 +2048,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if cap is self.capture and not cap.heard:
             self._notify("No sound from this microphone – check it's connected and not muted "
                          "(Windows Settings → Sound / Privacy → Microphone)", 9000)
+
+    def _toggle_solo(self, key):
+        """Show one view alone (the other is hidden), or both again if it was already alone."""
+        self.solo = None if self.solo == key else key
+        self.spec_card.setVisible(self.solo != "roll")
+        self.roll_card.setVisible(self.solo != "spec")
+        self._update_expand_icons()
+
+    def _update_expand_icons(self):
+        if not hasattr(self, "th"):
+            return
+        for key, b in self.expand_btns.items():
+            alone = self.solo == key
+            b.setIcon(QtGui.QIcon(self._expand_icon(self.th["dim"], collapse=alone)))
+            b.setIconSize(QtCore.QSize(10, 10))
+            b.setToolTip("Back to both views" if alone else ("Spectrum only" if key == "spec" else "Piano only"))
+            b.raise_()
 
     def _rescan_devices(self):
         self._populate_devices(rescan=True)
