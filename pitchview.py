@@ -166,7 +166,7 @@ def level_gradient(lut_q, r, h_thr, h_top):
     return QtGui.QBrush(g)
 
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 FROZEN = getattr(sys, "frozen", False)  # running as the packaged .exe
 # bundled files (fonts, icon) live next to the script, or in PyInstaller's unpack folder when frozen
 APP_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
